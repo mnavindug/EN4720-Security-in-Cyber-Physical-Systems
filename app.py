@@ -8,8 +8,11 @@ from cryptography.hazmat.primitives import padding
 from Crypto.Cipher import DES
 from flask import Flask, request, jsonify
 import base64
-import sqlite3
 from hashlib import sha256, sha512
+import pymysql
+from dotenv import load_dotenv
+
+load_dotenv()
 
 app = Flask(__name__)
 
@@ -17,12 +20,19 @@ app = Flask(__name__)
 def db_connection():
     conn = None
     try:
-        # connect to the database if not a database create a one
-        conn = sqlite3.connect("key_database.sqlite")
+        conn = pymysql.connect(
+            database=os.getenv('DATABASE'),
+            host =os.getenv('HOST'),
+            user =os.getenv('USER'),
+            password=os.getenv('PASSWORD'),
+            charset=os.getenv('CHARSET'),
+            cursorclass=pymysql.cursors.DictCursor
+            ) #connect to the database if not a database create a one
+        
         # define the structure of the database
         cursor = conn.cursor()
-        sql_query = ''' CREATE TABLE IF NOT EXISTS keys (
-                    id INTEGER PRIMARY KEY,
+        sql_query = ''' CREATE TABLE IF NOT EXISTS APIkeys (
+                    id INTEGER AUTO_INCREMENT PRIMARY KEY,
                     private_key BLOB NOT NULL,
                     public_key BLOB,
                     algorithm TEXT NOT NULL,
@@ -30,7 +40,7 @@ def db_connection():
                 ) '''
         cursor.execute(sql_query)
         return conn
-    except sqlite3.Error as e:
+    except pymysql.Error as e:
         print(e)
         return None
 
@@ -59,7 +69,7 @@ def generateKey(algorithm, keySize, conn):
         else:
             return jsonify({"error": "Unsupported key generation algorithm"}), 400
         key_b64 = base64.b64encode(key).decode()
-        sql_query = ''' INSERT INTO keys (private_key, algorithm) VALUES (?, ?) '''
+        sql_query = ''' INSERT INTO APIkeys (private_key, algorithm) VALUES (%s, %s) '''
         cursor.execute(sql_query, (key_b64, algorithm,))
         conn.commit()
         key_id = cursor.lastrowid
@@ -86,7 +96,7 @@ def generateKey(algorithm, keySize, conn):
         )
         private_key_b64 = base64.b64encode(private_pem).decode()
         public_key_b64 = base64.b64encode(public_pem).decode()
-        sql_query = ''' INSERT INTO keys (private_key, algorithm, public_key) VALUES (?, ?, ?) '''
+        sql_query = '''INSERT INTO APIkeys (private_key, algorithm, public_key) VALUES (%s, %s, %s)'''
         cursor.execute(sql_query, (private_key_b64, algorithm, public_key_b64))
         conn.commit()
         key_id = cursor.lastrowid
@@ -98,18 +108,18 @@ def generateKey(algorithm, keySize, conn):
 def encryption(algorithm, key_id, plaintext, conn):
     plaintext = plaintext.encode()
     cursor = conn.cursor()
-    cursor.execute("SELECT private_key FROM keys WHERE id = ?", (key_id,))
+    cursor.execute("SELECT private_key FROM APIkeys WHERE id = %s", (key_id,))
     result = cursor.fetchone()
     if result is None:
-        return None, jsonify({"error": f"Key ID {key_id} not found"}), 404
-    key = result[0]
+        return jsonify({"error": f"Key ID {key_id} not found"}), 404
+    key = result["private_key"]
     key = base64.b64decode(key)
 
     if algorithm == 'AES':
         # Generate a random Initialization Vector (IV)
         # regardless of the key size, the IV is always 16 bytes for AES
         iv = os.urandom(algorithms.AES.block_size//8)
-        cursor.execute("UPDATE keys SET iv = ? WHERE id = ?", (iv, key_id))
+        cursor.execute("UPDATE APIkeys SET iv = %s WHERE id = %s", (iv, key_id))
         conn.commit()
         padder = padding.PKCS7(algorithms.AES.block_size).padder()
         padded_plaintext = padder.update(plaintext) + padder.finalize()
@@ -121,7 +131,7 @@ def encryption(algorithm, key_id, plaintext, conn):
         # Generate a random Initialization Vector (IV)
         # regardless of the key size, the IV is always 8 bytes for DES
         iv = os.urandom(64//8)
-        cursor.execute("UPDATE keys SET iv = ? WHERE id = ?", (iv, key_id))
+        cursor.execute("UPDATE APIkeys SET iv = %s WHERE id = %s", (iv, key_id))
         conn.commit()
         padder = padding.PKCS7(64).padder()
         padded_plaintext = padder.update(plaintext) + padder.finalize()
@@ -133,7 +143,7 @@ def encryption(algorithm, key_id, plaintext, conn):
         # Generate a random Initialization Vector (IV)
         # regardless of the key size, the IV is always 8 bytes for 3DES
         iv = os.urandom(algorithms.TripleDES.block_size//8)
-        cursor.execute("UPDATE keys SET iv = ? WHERE id = ?", (iv, key_id))
+        cursor.execute("UPDATE APIkeys SET iv = %s WHERE id = %s", (iv, key_id))
         conn.commit()
         padder = padding.PKCS7(algorithms.TripleDES.block_size).padder()
         padded_plaintext = padder.update(plaintext) + padder.finalize()
@@ -142,11 +152,11 @@ def encryption(algorithm, key_id, plaintext, conn):
         ct = encryptor.update(padded_plaintext) + encryptor.finalize()
 
     elif algorithm == 'RSA':
-        cursor.execute("SELECT public_key FROM keys WHERE id = ?", (key_id,))
+        cursor.execute("SELECT public_key FROM APIkeys WHERE id = %s", (key_id,))
         result = cursor.fetchone()
         if result is None:
             return jsonify({"error": f"Public key not found for Key ID {key_id}"}), 400
-        public_key = result[0]
+        public_key = result["public_key"]
         public_key = base64.b64decode(public_key)
         public_key = serialization.load_pem_public_key(public_key)
         ct = public_key.encrypt(
@@ -165,17 +175,17 @@ def encryption(algorithm, key_id, plaintext, conn):
 
 def decryption(algorithm, key_id, cipher_text, conn):
     cursor = conn.cursor()
-    cursor.execute("SELECT private_key FROM keys WHERE id = ?", (key_id,))
+    cursor.execute("SELECT private_key FROM APIkeys WHERE id = %s", (key_id,))
     result = cursor.fetchone()
     if result is None:
         return jsonify({"error": f"Key ID {key_id} not found"}), 400
-    key = result[0]
+    key = result["private_key"]
     if algorithm in ['AES', 'DES', '3DES']:
-        cursor.execute("SELECT iv FROM keys WHERE id = ?", (key_id,))
+        cursor.execute("SELECT private_key, iv FROM APIkeys WHERE id = %s", (key_id,))
         result = cursor.fetchone()
-        if result is None:
+        if result['iv'] is None:
             return jsonify({"error": f"IV not found for Key ID {key_id}"}), 400
-        iv = result[0]
+        iv = result["iv"]
     cipher_text = base64.b64decode(cipher_text)
     key = base64.b64decode(key)
 

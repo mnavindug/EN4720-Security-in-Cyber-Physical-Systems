@@ -8,17 +8,24 @@ from cryptography.hazmat.primitives import padding
 from Crypto.Cipher import DES
 from flask import Flask, request, jsonify
 import base64
+from hashlib import sha256, sha512
 import pymysql
+from dotenv import load_dotenv
+
+load_dotenv()
+
+app = Flask(__name__)
+
 
 def db_connection():
     conn = None
     try:
         conn = pymysql.connect(
-            database="sql12768605", #database name
-            host = "sql12.freesqldatabase.com", #host name
-            user ="sql12768605", #username
-            password="Tb7jbEg8we", #password
-            charset='utf8mb4',
+            database=os.getenv('DATABASE'),
+            host =os.getenv('HOST'),
+            user =os.getenv('USER'),
+            password=os.getenv('PASSWORD'),
+            charset=os.getenv('CHARSET'),
             cursorclass=pymysql.cursors.DictCursor
             ) #connect to the database if not a database create a one
         
@@ -36,157 +43,181 @@ def db_connection():
     except pymysql.Error as e:
         print(e)
         return None
-    
-def generateKey(algo, keySize, conn):
-    cursor = conn.cursor()
 
-    if (algo == "RSA"):
-        
+
+def generateKey(algorithm, keySize, conn):
+    cursor = conn.cursor()
+    if isinstance(keySize, str):
+        keySize = int(keySize)
+    if algorithm in ['AES', 'DES', '3DES']:
+        if algorithm == 'AES':
+            if keySize not in [128, 192, 256]:
+                return jsonify({"error": "Invalid key size for AES. Must be 128, 192, or 256 bits."}), 400
+            else:
+                key = os.urandom(int(keySize/8))
+        elif algorithm == 'DES':
+            if keySize not in [56, 64]:
+                return jsonify({"error": "Invalid key size for DES. Must be 56, or 64 bits."}), 400
+            else:
+                key = os.urandom(8)
+        elif algorithm == '3DES':
+            if keySize not in [56, 64, 112, 128, 168, 192]:
+                return jsonify({"error": f"Invalid key size for 3DES. Must be 56, 64, 112, 128, 168, or 192 bits."}), 400
+            else:
+                size_map = {56: 8, 64: 8, 112: 16, 128: 16, 168: 24, 192: 24}
+                key = os.urandom(size_map[keySize])
+        else:
+            return jsonify({"error": "Unsupported key generation algorithm"}), 400
+        key_b64 = base64.b64encode(key).decode()
+        sql_query = ''' INSERT INTO APIkeys (private_key, algorithm) VALUES (%s, %s) '''
+        cursor.execute(sql_query, (key_b64, algorithm,))
+        conn.commit()
+        key_id = cursor.lastrowid
+        return jsonify({'key_id': key_id, 'key_value': key_b64})
+
+    elif algorithm == 'RSA':
+        if keySize not in [1024, 2048, 3072, 4096]:
+            return jsonify({"error": "Invalid key size for RSA. Must be 1024, 2048, 3072, or 4096 bits."}), 400
         private_key = rsa.generate_private_key(
-            public_exponent=65537, #a prime number such as being relatively prime to 𝜙(𝑛)=(p-1)x(q-1) ,p,q prime of n 
-            key_size= keySize,
+            # a prime number such as being relatively prime to 𝜙(𝑛)=(p-1)x(q-1) ,p,q prime of n
+            public_exponent=65537,
+            key_size=keySize,
         )
         public_key = private_key.public_key()
-       
         # Serialize keys
         private_pem = private_key.private_bytes(
             encoding=serialization.Encoding.PEM,
             format=serialization.PrivateFormat.PKCS8,
             encryption_algorithm=serialization.NoEncryption()
         )
-
         public_pem = public_key.public_bytes(
             encoding=serialization.Encoding.PEM,
             format=serialization.PublicFormat.SubjectPublicKeyInfo
         )
-                
+        private_key_b64 = base64.b64encode(private_pem).decode()
+        public_key_b64 = base64.b64encode(public_pem).decode()
         sql_query = '''INSERT INTO APIkeys (private_key, algorithm, public_key) VALUES (%s, %s, %s)'''
-        cursor.execute(sql_query, (private_pem, algo, public_pem))
+        cursor.execute(sql_query, (private_key_b64, algorithm, public_key_b64))
         conn.commit()
+        key_id = cursor.lastrowid
+        return jsonify({'key_id': key_id, 'key_value': private_key_b64})
+    else:
+        return jsonify({"error": "Unsupported key generation algorithm"}), 400
 
-        
-        return private_pem.decode("utf-8"), cursor
 
-    if algo in ("AES", "DES", "3DES"):
-        key = os.urandom(int(keySize/8))
-
-        sql_query = ''' INSERT INTO APIkeys (private_key, algorithm) VALUES (%s, %s) '''
-        cursor.execute(sql_query, (key, algo))
-        conn.commit()
-
-        key = base64.b64encode(key)
-        return key, cursor
-    
-
-    
-def encryption(algo, key_id, data, conn):
-
-    data = data.encode('utf-8')
+def encryption(algorithm, key_id, plaintext, conn):
+    plaintext = plaintext.encode()
     cursor = conn.cursor()
     cursor.execute("SELECT private_key FROM APIkeys WHERE id = %s", (key_id,))
-    key = cursor.fetchone()["private_key"]
-    ksize = len(key)
-    
-    if algo == 'AES':
+    result = cursor.fetchone()
+    if result is None:
+        return jsonify({"error": f"Key ID {key_id} not found"}), 404
+    key = result["private_key"]
+    key = base64.b64decode(key)
+
+    if algorithm == 'AES':
         # Generate a random Initialization Vector (IV)
-        iv = os.urandom(int(128/8))  # IV should be unique for each encryption 16 bit fixed size (AES blocksize is 128 bits)
+        # regardless of the key size, the IV is always 16 bytes for AES
+        iv = os.urandom(algorithms.AES.block_size//8)
         cursor.execute("UPDATE APIkeys SET iv = %s WHERE id = %s", (iv, key_id))
         conn.commit()
-
-        # Padding data to fit block size (16 bytes for AES)
-        padder = padding.PKCS7(ksize*8).padder()  # Block size is 128 bits = 16 bytes
-        padded_data = padder.update(data) + padder.finalize()
-
+        padder = padding.PKCS7(algorithms.AES.block_size).padder()
+        padded_plaintext = padder.update(plaintext) + padder.finalize()
         cipher = Cipher(algorithms.AES(key), modes.CBC(iv))
-
         encryptor = cipher.encryptor()
-        ct = encryptor.update(padded_data) + encryptor.finalize()
-        return ct
-    
-    if algo == 'DES':
+        ct = encryptor.update(padded_plaintext) + encryptor.finalize()
+
+    elif algorithm == 'DES':
         # Generate a random Initialization Vector (IV)
-        iv = os.urandom(int(64/8))  # IV should be unique for each encryption 16 bit fixed size (DES blocksize is 64 bits)
+        # regardless of the key size, the IV is always 8 bytes for DES
+        iv = os.urandom(64//8)
         cursor.execute("UPDATE APIkeys SET iv = %s WHERE id = %s", (iv, key_id))
         conn.commit()
-
+        padder = padding.PKCS7(64).padder()
+        padded_plaintext = padder.update(plaintext) + padder.finalize()
         # Create DES cipher in CBC mode
         cipher = DES.new(key, DES.MODE_CBC, iv)
-        
-        padded_plaintext = data.ljust(128, b'\x00')  # Pad to 16 bytes
         ct = cipher.encrypt(padded_plaintext)
 
-        return ct
-    
-    if algo == '3DES':
-        iv = os.urandom(int(64/8))  # IV should be unique for each encryption 16 bit fixed size (DES blocksize is 64 bits)
+    elif algorithm == '3DES':
+        # Generate a random Initialization Vector (IV)
+        # regardless of the key size, the IV is always 8 bytes for 3DES
+        iv = os.urandom(algorithms.TripleDES.block_size//8)
         cursor.execute("UPDATE APIkeys SET iv = %s WHERE id = %s", (iv, key_id))
         conn.commit()
-
-        # Padding data to fit block size (16 bytes for AES)
-        padder = padding.PKCS7(ksize*8).padder()  # Block size is 128 bits = 16 bytes
-        padded_data = padder.update(data) + padder.finalize()
-
+        padder = padding.PKCS7(algorithms.TripleDES.block_size).padder()
+        padded_plaintext = padder.update(plaintext) + padder.finalize()
         cipher = Cipher(algorithms.TripleDES(key), modes.CBC(iv))
-        
         encryptor = cipher.encryptor()
-        ct = encryptor.update(padded_data) + encryptor.finalize()
-        return ct
-    
-    if algo == 'RSA':
-        cursor.execute("SELECT public_key FROM APIkeys WHERE id = %s", (key_id,))
-        public_pem = cursor.fetchone()["public_key"]
-        public_key = serialization.load_pem_public_key(public_pem)
+        ct = encryptor.update(padded_plaintext) + encryptor.finalize()
 
+    elif algorithm == 'RSA':
+        cursor.execute("SELECT public_key FROM APIkeys WHERE id = %s", (key_id,))
+        result = cursor.fetchone()
+        if result is None:
+            return jsonify({"error": f"Public key not found for Key ID {key_id}"}), 400
+        public_key = result["public_key"]
+        public_key = base64.b64decode(public_key)
+        public_key = serialization.load_pem_public_key(public_key)
         ct = public_key.encrypt(
-            data,
+            plaintext,
             paddingAs.OAEP(
                 mgf=paddingAs.MGF1(algorithm=hashes.SHA256()),
                 algorithm=hashes.SHA256(),
                 label=None
             )
         )
-        return ct
+    else:
+        return jsonify({"error": "Unsupported encryption algorithm"}), 400
+    ct_b64 = base64.b64encode(ct).decode()
+    return jsonify({'ciphertext': ct_b64})
 
-def decryption(algo, key_id, cipher_text, conn):
+
+def decryption(algorithm, key_id, cipher_text, conn):
     cursor = conn.cursor()
     cursor.execute("SELECT private_key FROM APIkeys WHERE id = %s", (key_id,))
-    key = cursor.fetchone()["private_key"]
-    cursor.execute("SELECT iv FROM APIkeys WHERE id = %s", (key_id,))
-    iv = cursor.fetchone()["iv"]
+    result = cursor.fetchone()
+    if result is None:
+        return jsonify({"error": f"Key ID {key_id} not found"}), 400
+    key = result["private_key"]
+    if algorithm in ['AES', 'DES', '3DES']:
+        cursor.execute("SELECT private_key, iv FROM APIkeys WHERE id = %s", (key_id,))
+        result = cursor.fetchone()
+        if result['iv'] is None:
+            return jsonify({"error": f"IV not found for Key ID {key_id}"}), 400
+        iv = result["iv"]
+    cipher_text = base64.b64decode(cipher_text)
+    key = base64.b64decode(key)
 
-    if algo == 'AES':
-        
-        cipher = Cipher(algorithms.AES(key), modes.CBC(iv))
-
-        decryptor = cipher.decryptor()
-        decrypted_padded_data = decryptor.update(cipher_text) + decryptor.finalize()
+    if algorithm == 'AES':
+        decipher = Cipher(algorithms.AES(key), modes.CBC(iv))
+        decryptor = decipher.decryptor()
+        decrypted_padded_plaintext = decryptor.update(
+            cipher_text) + decryptor.finalize()
         # Remove padding
-        unpadder = padding.PKCS7(len(key)*8).unpadder()
-        decrypted_data = unpadder.update(decrypted_padded_data) + unpadder.finalize()
-        return decrypted_data
-    
-    if algo == 'DES':
-        
+        unpadder = padding.PKCS7(algorithms.AES.block_size).unpadder()
+        decrypted_data = unpadder.update(
+            decrypted_padded_plaintext) + unpadder.finalize()
+
+    elif algorithm == 'DES':
         decipher = DES.new(key, DES.MODE_CBC, iv)
-       
         decrypted_padded_plaintext = decipher.decrypt(cipher_text)
-        decrypted_data = decrypted_padded_plaintext.rstrip(b'\x00')
-
-        return decrypted_data
-    
-    if algo == '3DES':
-
-        cipher = Cipher(algorithms.TripleDES(key), modes.CBC(iv))
-    
-        decryptor = cipher.decryptor()
-        
-        decrypted_padded_data = decryptor.update(cipher_text) + decryptor.finalize()
         # Remove padding
-        unpadder = padding.PKCS7(len(key)*8).unpadder()
-        decrypted_data = unpadder.update(decrypted_padded_data) + unpadder.finalize()
-        return decrypted_data
-    
-    if algo == 'RSA':
+        unpadder = padding.PKCS7(64).unpadder()
+        decrypted_data = unpadder.update(
+            decrypted_padded_plaintext) + unpadder.finalize()
+
+    elif algorithm == '3DES':
+        decipher = Cipher(algorithms.TripleDES(key), modes.CBC(iv))
+        decryptor = decipher.decryptor()
+        decrypted_padded_plaintext = decryptor.update(
+            cipher_text) + decryptor.finalize()
+        # Remove padding
+        unpadder = padding.PKCS7(algorithms.TripleDES.block_size).unpadder()
+        decrypted_data = unpadder.update(
+            decrypted_padded_plaintext) + unpadder.finalize()
+
+    elif algorithm == 'RSA':
         key = serialization.load_pem_private_key(
             key,
             password=None
@@ -199,45 +230,81 @@ def decryption(algo, key_id, cipher_text, conn):
                 label=None
             )
         )
-        return decrypted_data
-    
+    else:
+        return jsonify({"error": "Unsupported encryption algorithm"}), 400
+    return jsonify({'plaintext': str(decrypted_data.decode())})
 
-app = Flask(__name__)
 
 @app.route('/generate-key', methods=['POST'])
 def generating_key():
-    conn = db_connection() #connect to the database
+    conn = db_connection()  # connect to the database
+    data = request.json
+    algorithm = data.get('key_type')
+    keySize = data.get('key_size')
+    print(algorithm, keySize)
+    return generateKey(algorithm, keySize, conn)
 
-    algo = request.form['key_type']
-    keySize = request.form['key_size']
-    key, cursor = generateKey(algo, int(keySize), conn)
-    key_id = cursor.lastrowid
-    
-    conn.close()
-    return jsonify({'key_id':key_id, 'key_value':str(key)})
 
 @app.route('/encrypt', methods=['POST'])
 def encrypt():
-    conn = db_connection() #connect to the database
+    conn = db_connection()  # connect to the database
+    data = request.json
+    algorithm = data.get('algorithm')
+    key_id = data.get('key_id')
+    plaintext = data.get('plaintext')
+    return encryption(algorithm, key_id, plaintext, conn)
 
-    algo = request.form['algorithm']
-    key_id = request.form['key_id']
-    data = request.form['plaintext']
-    cipher_text = base64.b64encode(encryption(algo, int(key_id), data, conn))
-    conn.close()
-    return jsonify({'ciphertext':str(cipher_text)})
 
 @app.route('/decrypt', methods=['POST'])
 def decrypt():
-    conn = db_connection() #connect to the database
+    conn = db_connection()  # connect to the database
+    data = request.json
+    algorithm = data.get('algorithm')
+    key_id = data.get('key_id')
+    cipher_text = data.get('ciphertext')
+    return decryption(algorithm, key_id, cipher_text, conn)
 
-    algo = request.form['algorithm']
-    key_id = request.form['key_id']
-    cipher_text = request.form['ciphertext']
-    ct = base64.b64decode(cipher_text[2:-1].encode('utf-8'))
-    data = decryption(algo, int(key_id), ct, conn)
-    conn.close()
-    return jsonify({'plaintext':str(data.decode('utf-8'))})
+
+@app.route("/generate-hash", methods=["POST"])
+def generate_hash():
+    data = request.json
+    input_data = data.get("data")
+    algorithm = data.get("algorithm")
+
+    if algorithm.upper() == "SHA-256":
+        hash_value = sha256(input_data.encode()).digest()
+    elif algorithm.upper() == "SHA-512":
+        hash_value = sha512(input_data.encode()).digest()
+    else:
+        return jsonify({"error": "Unsupported hash algorithm"}), 400
+
+    return jsonify({
+        "hash_value": base64.b64encode(hash_value).decode(),
+        "algorithm": algorithm
+    })
+
+
+@app.route("/verify-hash", methods=["POST"])
+def verify_hash():
+    data = request.json
+    input_data = data.get("data")
+    hash_value = data.get("hash_value")
+    algorithm = data.get("algorithm")
+
+    if algorithm.upper() == "SHA-256":
+        expected_hash = sha256(input_data.encode()).digest()
+    elif algorithm.upper() == "SHA-512":
+        expected_hash = sha512(input_data.encode()).digest()
+    else:
+        return jsonify({"error": "Unsupported hash algorithm"}), 400
+
+    is_valid = base64.b64encode(expected_hash).decode() == hash_value
+
+    return jsonify({
+        "is_valid": is_valid,
+        "message": "Hash matches the data." if is_valid else "Hash does not match."
+    })
+
 
 if __name__ == '__main__':
     app.run(debug=True)

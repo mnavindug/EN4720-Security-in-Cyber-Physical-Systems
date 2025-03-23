@@ -4,3 +4,4 @@ pycryptodome==3.22.0
 requests==2.32.3
 PyMySQL==1.1.1
 python-dotenv==1.0.1
+gunicorn

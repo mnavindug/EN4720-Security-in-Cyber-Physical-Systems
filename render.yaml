@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: crypto-api
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app
+    envVars:
+      - key: DATABASE
+        value: sql12768605
+      - key: HOST
+        value: sql12.freesqldatabase.com
+      - key: USER
+        value: sql12768605
+      - key: PASSWORD
+        value: Tb7jbEg8we
+      - key: CHARSET
+        value: utf8mb4

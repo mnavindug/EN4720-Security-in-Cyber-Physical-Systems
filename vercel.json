@@ -1,0 +1,17 @@
+{
+    "version": 2,
+    "builds": [
+      {
+        "src": "app.py",
+        "use": "@vercel/python"
+      }
+    ],
+    "env": {
+      "DATABASE": "@DATABASE",
+      "HOST": "@HOST",
+      "USER": "@USER",
+      "PASSWORD": "@PASSWORD",
+      "CHARSET": "@CHARSET"
+    }
+  }
+  
